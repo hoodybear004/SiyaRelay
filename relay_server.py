@@ -1,12 +1,13 @@
 import asyncio
 import json
 import logging
+import os
 from collections import defaultdict
 
 import websockets
 
 HOST = "0.0.0.0"
-PORT = 8765
+PORT = int(os.environ.get("PORT", "8765"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -16,12 +17,14 @@ client_info = {}
 revoke_acks = {}
 locks = defaultdict(asyncio.Lock)
 
+
 async def send_json(ws, data):
     try:
         await ws.send(json.dumps(data, ensure_ascii=False))
         return True
     except Exception:
         return False
+
 
 async def broadcast(group, data, exclude=None):
     dead = []
@@ -33,6 +36,20 @@ async def broadcast(group, data, exclude=None):
     for ws in dead:
         clients[group].discard(ws)
 
+
+def viewer_count(group):
+    return sum(
+        1 for ws in clients.get(group, set())
+        if client_info.get(ws, {}).get("role") == "viewer"
+    )
+
+
+async def announce_viewer_count(group):
+    host = hosts.get(group)
+    if host:
+        await send_json(host, {"type": "viewer_count", "count": viewer_count(group)})
+
+
 async def announce_host(group):
     host = hosts.get(group)
     info = client_info.get(host, {}) if host else {}
@@ -41,6 +58,8 @@ async def announce_host(group):
         "present": bool(host),
         "name": info.get("name", "") if host else ""
     })
+    await announce_viewer_count(group)
+
 
 async def grant_host(group, ws):
     hosts[group] = ws
@@ -48,13 +67,15 @@ async def grant_host(group, ws):
     await announce_host(group)
     logging.info("Host granted group=%s name=%s", group, client_info.get(ws, {}).get("name"))
 
+
 async def claim_host(group, ws):
     async with locks[group]:
         current = hosts.get(group)
         if current is ws:
             await send_json(ws, {"type": "host_granted"})
+            await announce_viewer_count(group)
             return
-        if current is None or current.closed:
+        if current is None or getattr(current, "closed", False):
             await grant_host(group, ws)
             return
 
@@ -75,6 +96,7 @@ async def claim_host(group, ws):
             hosts.pop(group, None)
         await send_json(current, {"type": "host_replaced"})
         await grant_host(group, ws)
+
 
 async def handler(ws):
     group = None
@@ -97,6 +119,7 @@ async def handler(ws):
             "client_id": str(hello.get("client_id", "")),
             "group": group,
         }
+
         current = hosts.get(group)
         info = client_info.get(current, {}) if current else {}
         await send_json(ws, {
@@ -104,6 +127,7 @@ async def handler(ws):
             "present": bool(current),
             "name": info.get("name", "") if current else ""
         })
+        await announce_viewer_count(group)
 
         async for raw in ws:
             data = json.loads(raw)
@@ -135,13 +159,17 @@ async def handler(ws):
                 hosts.pop(group, None)
                 await announce_host(group)
                 logging.info("Host disconnected group=%s name=%s", group, info.get("name"))
+            else:
+                await announce_viewer_count(group)
             if not clients[group]:
                 clients.pop(group, None)
 
+
 async def main():
-    async with websockets.serve(handler, HOST, PORT, ping_interval=15, ping_timeout=15):
+    async with websockets.serve(handler, HOST, PORT, ping_interval=15, ping_timeout=30):
         logging.info("시아의개고생 중계서버 실행: ws://%s:%s", HOST, PORT)
         await asyncio.Future()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
