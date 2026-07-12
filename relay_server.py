@@ -40,11 +40,26 @@ async def broadcast(group, data, exclude=None):
 
 
 def get_viewer_count(group):
-    return sum(
-        1
-        for ws in clients.get(group, set())
-        if client_info.get(ws, {}).get("role") == "viewer"
-    )
+    """
+    같은 시청자 프로그램이 재연결하면서 이전 WebSocket이 잠시 남아도
+    client_id가 같으면 한 명으로 계산한다.
+    client_id가 없는 구형 시청자만 연결 개수대로 계산한다.
+    """
+    unique_client_ids = set()
+    viewers_without_id = 0
+
+    for ws in clients.get(group, set()):
+        info = client_info.get(ws, {})
+        if info.get("role") != "viewer":
+            continue
+
+        client_id = str(info.get("client_id", "")).strip()
+        if client_id:
+            unique_client_ids.add(client_id)
+        else:
+            viewers_without_id += 1
+
+    return len(unique_client_ids) + viewers_without_id
 
 
 async def announce_viewer_count(group):
