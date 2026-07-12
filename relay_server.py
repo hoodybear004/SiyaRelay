@@ -20,46 +20,43 @@ locks = defaultdict(asyncio.Lock)
 
 async def send_json(ws, data):
     try:
-        await ws.send(json.dumps(data, ensure_ascii=False))
+        await asyncio.wait_for(
+            ws.send(json.dumps(data, ensure_ascii=False)),
+            timeout=1.5
+        )
         return True
     except Exception:
         return False
 
 
 async def broadcast(group, data, exclude=None):
-    dead = []
-    for ws in list(clients.get(group, set())):
-        if ws is exclude:
-            continue
-        if not await send_json(ws, data):
-            dead.append(ws)
+    targets = [
+        ws for ws in list(clients.get(group, set()))
+        if ws is not exclude
+    ]
 
-    for ws in dead:
-        clients[group].discard(ws)
-        client_info.pop(ws, None)
+    if not targets:
+        return
+
+    # 시청자별로 순차 전송하면 느리거나 죽은 연결 하나가 전체를 지연시킬 수 있다.
+    # 모든 시청자에게 동시에 보내고, 실패한 연결만 정리한다.
+    results = await asyncio.gather(
+        *(send_json(ws, data) for ws in targets),
+        return_exceptions=True
+    )
+
+    for ws, result in zip(targets, results):
+        if result is not True:
+            clients[group].discard(ws)
+            client_info.pop(ws, None)
 
 
 def get_viewer_count(group):
-    """
-    같은 시청자 프로그램이 재연결하면서 이전 WebSocket이 잠시 남아도
-    client_id가 같으면 한 명으로 계산한다.
-    client_id가 없는 구형 시청자만 연결 개수대로 계산한다.
-    """
-    unique_client_ids = set()
-    viewers_without_id = 0
-
-    for ws in clients.get(group, set()):
-        info = client_info.get(ws, {})
-        if info.get("role") != "viewer":
-            continue
-
-        client_id = str(info.get("client_id", "")).strip()
-        if client_id:
-            unique_client_ids.add(client_id)
-        else:
-            viewers_without_id += 1
-
-    return len(unique_client_ids) + viewers_without_id
+    return sum(
+        1
+        for ws in clients.get(group, set())
+        if client_info.get(ws, {}).get("role") == "viewer"
+    )
 
 
 async def announce_viewer_count(group):
