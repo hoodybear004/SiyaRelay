@@ -26,14 +26,6 @@ async def send_json(ws, data):
         return False
 
 
-async def remove_client(ws):
-    info = client_info.pop(ws, {})
-    group = info.get("group")
-    if group:
-        clients[group].discard(ws)
-    return info
-
-
 async def broadcast(group, data, exclude=None):
     dead = []
     for ws in list(clients.get(group, set())):
@@ -43,7 +35,8 @@ async def broadcast(group, data, exclude=None):
             dead.append(ws)
 
     for ws in dead:
-        await remove_client(ws)
+        clients[group].discard(ws)
+        client_info.pop(ws, None)
 
 
 def get_viewer_count(group):
@@ -96,17 +89,22 @@ async def claim_host(group, ws):
             await announce_viewer_count(group)
             return
 
-        if current is None:
+        # Do not access current.closed; newer websockets versions may not expose it.
+        if current is None or current not in client_info:
             await grant_host(group, ws)
             return
 
         ack = asyncio.Event()
         revoke_acks[current] = ack
 
-        await send_json(current, {
+        if not await send_json(current, {
             "type": "host_revoke",
             "message": "다른 사용자가 호스트 변경을 요청했습니다."
-        })
+        }):
+            hosts.pop(group, None)
+            revoke_acks.pop(current, None)
+            await grant_host(group, ws)
+            return
 
         try:
             await asyncio.wait_for(ack.wait(), timeout=5.0)
@@ -137,7 +135,6 @@ async def handler(ws):
             return
 
         group = str(hello.get("group", "")).strip()
-
         if not group:
             await send_json(ws, {
                 "type": "error",
@@ -152,6 +149,13 @@ async def handler(ws):
             "client_id": str(hello.get("client_id", "")),
             "group": group,
         }
+
+        logging.info(
+            "Connection open group=%s role=%s name=%s",
+            group,
+            client_info[ws]["role"],
+            client_info[ws]["name"]
+        )
 
         current = hosts.get(group)
         info = client_info.get(current, {}) if current else {}
@@ -194,12 +198,14 @@ async def handler(ws):
                 await send_json(ws, {"type": "pong"})
 
     except Exception as exc:
-        logging.info("Client disconnected: %s", exc)
+        logging.exception("Client handler error: %s", exc)
 
     finally:
-        info = await remove_client(ws)
+        info = client_info.pop(ws, {})
 
         if group:
+            clients[group].discard(ws)
+
             if hosts.get(group) is ws:
                 hosts.pop(group, None)
                 await announce_host(group)
@@ -214,6 +220,13 @@ async def handler(ws):
             if not clients.get(group):
                 clients.pop(group, None)
 
+        logging.info(
+            "Connection closed group=%s role=%s name=%s",
+            group,
+            info.get("role"),
+            info.get("name")
+        )
+
 
 async def main():
     async with websockets.serve(
@@ -221,13 +234,10 @@ async def main():
         HOST,
         PORT,
         ping_interval=15,
-        ping_timeout=30
+        ping_timeout=30,
+        close_timeout=3
     ):
-        logging.info(
-            "시아의개고생 중계서버 실행: ws://%s:%s",
-            HOST,
-            PORT
-        )
+        logging.info("시아의개고생 중계서버 실행: ws://%s:%s", HOST, PORT)
         await asyncio.Future()
 
 
