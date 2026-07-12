@@ -1,12 +1,14 @@
 import asyncio
 import json
 import logging
+import os
+import time
 from collections import defaultdict
 
 import websockets
 
 HOST = "0.0.0.0"
-PORT = 8765
+PORT = int(os.environ.get("PORT", "8765"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -16,39 +18,92 @@ client_info = {}
 revoke_acks = {}
 locks = defaultdict(asyncio.Lock)
 
+# 마지막 정상 통신 시각
+last_seen = {}
+
+# 동일한 viewer가 재접속했을 때 중복 연결을 제거하기 위한 인덱스
+viewer_sessions = {}
+
 
 async def send_json(ws, data):
     try:
         await ws.send(json.dumps(data, ensure_ascii=False))
+        last_seen[ws] = time.monotonic()
         return True
     except Exception:
         return False
 
 
+async def close_safely(ws, code=1000, reason=""):
+    try:
+        await ws.close(code=code, reason=reason)
+    except Exception:
+        pass
+
+
+async def remove_client(ws):
+    """연결 하나를 모든 인덱스에서 완전히 제거한다."""
+    info = client_info.pop(ws, {})
+    last_seen.pop(ws, None)
+
+    group = info.get("group")
+    if group:
+        clients[group].discard(ws)
+
+    if info.get("role") == "viewer":
+        key = (group, info.get("client_id", ""))
+        if viewer_sessions.get(key) is ws:
+            viewer_sessions.pop(key, None)
+
+    return info
+
+
 async def broadcast(group, data, exclude=None):
     dead = []
-    for ws in list(clients[group]):
+
+    for ws in list(clients.get(group, set())):
         if ws is exclude:
             continue
+
+        if getattr(ws, "closed", False):
+            dead.append(ws)
+            continue
+
         if not await send_json(ws, data):
             dead.append(ws)
 
     for ws in dead:
-        clients[group].discard(ws)
-        client_info.pop(ws, None)
+        await remove_client(ws)
 
 
 def get_viewer_count(group):
-    return sum(
-        1
-        for ws in clients.get(group, set())
-        if client_info.get(ws, {}).get("role") == "viewer"
-    )
+    """같은 client_id 중복 접속은 한 명으로 계산한다."""
+    unique_ids = set()
+    anonymous_count = 0
+
+    for ws in list(clients.get(group, set())):
+        info = client_info.get(ws, {})
+
+        if info.get("role") != "viewer":
+            continue
+
+        if getattr(ws, "closed", False):
+            continue
+
+        client_id = str(info.get("client_id", "")).strip()
+
+        if client_id:
+            unique_ids.add(client_id)
+        else:
+            anonymous_count += 1
+
+    return len(unique_ids) + anonymous_count
 
 
 async def announce_viewer_count(group):
     host = hosts.get(group)
-    if not host:
+
+    if not host or getattr(host, "closed", False):
         return
 
     await send_json(host, {
@@ -63,7 +118,7 @@ async def announce_host(group):
 
     await broadcast(group, {
         "type": "host_status",
-        "present": bool(host),
+        "present": bool(host and not getattr(host, "closed", False)),
         "name": info.get("name", "") if host else ""
     })
 
@@ -91,7 +146,7 @@ async def claim_host(group, ws):
             await announce_viewer_count(group)
             return
 
-        if current is None or current.closed:
+        if current is None or getattr(current, "closed", False):
             await grant_host(group, ws)
             return
 
@@ -117,11 +172,31 @@ async def claim_host(group, ws):
         await grant_host(group, ws)
 
 
+async def register_viewer_session(ws, group, client_id):
+    """같은 viewer 프로그램이 재접속하면 예전 연결을 닫아 중복 집계를 막는다."""
+    client_id = str(client_id or "").strip()
+
+    if not client_id:
+        return
+
+    key = (group, client_id)
+    old_ws = viewer_sessions.get(key)
+
+    if old_ws and old_ws is not ws and not getattr(old_ws, "closed", False):
+        logging.info("Replacing duplicate viewer session group=%s client_id=%s", group, client_id)
+        await close_safely(old_ws, code=4001, reason="duplicate viewer session")
+        await remove_client(old_ws)
+
+    viewer_sessions[key] = ws
+
+
 async def handler(ws):
     group = None
 
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
+        last_seen[ws] = time.monotonic()
+
         hello = json.loads(raw)
 
         if hello.get("type") != "hello":
@@ -140,27 +215,33 @@ async def handler(ws):
             })
             return
 
+        role = str(hello.get("role", "viewer"))
+        client_id = str(hello.get("client_id", ""))
+
         clients[group].add(ws)
         client_info[ws] = {
             "name": str(hello.get("name", "사용자")),
-            "role": str(hello.get("role", "viewer")),
-            "client_id": str(hello.get("client_id", "")),
+            "role": role,
+            "client_id": client_id,
             "group": group,
         }
+
+        if role == "viewer":
+            await register_viewer_session(ws, group, client_id)
 
         current = hosts.get(group)
         info = client_info.get(current, {}) if current else {}
 
         await send_json(ws, {
             "type": "host_status",
-            "present": bool(current),
+            "present": bool(current and not getattr(current, "closed", False)),
             "name": info.get("name", "") if current else ""
         })
 
-        # 시청자가 들어오면 현재 호스트에게 인원수 즉시 전송
         await announce_viewer_count(group)
 
         async for raw in ws:
+            last_seen[ws] = time.monotonic()
             data = json.loads(raw)
             kind = data.get("type")
 
@@ -193,11 +274,9 @@ async def handler(ws):
         logging.info("Client disconnected: %s", exc)
 
     finally:
-        info = client_info.pop(ws, {})
+        info = await remove_client(ws)
 
         if group:
-            clients[group].discard(ws)
-
             if hosts.get(group) is ws:
                 hosts.pop(group, None)
                 await announce_host(group)
@@ -208,27 +287,66 @@ async def handler(ws):
                     info.get("name")
                 )
             else:
-                # 시청자가 나가면 호스트에게 갱신된 인원수 전송
                 await announce_viewer_count(group)
 
-            if not clients[group]:
+            if not clients.get(group):
                 clients.pop(group, None)
 
 
+async def stale_connection_cleanup():
+    """
+    브라우저 강제종료·인터넷 단절 등으로 종료 이벤트가 늦게 오는 연결을 정리한다.
+    35초 동안 아무 통신이 없으면 닫고 인원수를 갱신한다.
+    """
+    while True:
+        await asyncio.sleep(5)
+        now = time.monotonic()
+        stale = []
+
+        for ws, seen_at in list(last_seen.items()):
+            if getattr(ws, "closed", False) or now - seen_at > 35:
+                stale.append(ws)
+
+        affected_groups = set()
+
+        for ws in stale:
+            info = client_info.get(ws, {})
+            group = info.get("group")
+
+            if group:
+                affected_groups.add(group)
+
+            await close_safely(ws, code=4000, reason="stale connection")
+            await remove_client(ws)
+
+            if group and hosts.get(group) is ws:
+                hosts.pop(group, None)
+
+        for group in affected_groups:
+            await announce_host(group)
+            await announce_viewer_count(group)
+
+
 async def main():
-    async with websockets.serve(
-        handler,
-        HOST,
-        PORT,
-        ping_interval=15,
-        ping_timeout=15
-    ):
-        logging.info(
-            "시아의개고생 중계서버 실행: ws://%s:%s",
+    cleanup_task = asyncio.create_task(stale_connection_cleanup())
+
+    try:
+        async with websockets.serve(
+            handler,
             HOST,
-            PORT
-        )
-        await asyncio.Future()
+            PORT,
+            ping_interval=10,
+            ping_timeout=10,
+            close_timeout=2
+        ):
+            logging.info(
+                "시아의개고생 중계서버 실행: ws://%s:%s",
+                HOST,
+                PORT
+            )
+            await asyncio.Future()
+    finally:
+        cleanup_task.cancel()
 
 
 if __name__ == "__main__":
