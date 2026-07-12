@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 from collections import defaultdict
 
 import websockets
@@ -18,17 +17,13 @@ client_info = {}
 revoke_acks = {}
 locks = defaultdict(asyncio.Lock)
 
-# 마지막 정상 통신 시각
-last_seen = {}
-
-# 동일한 viewer가 재접속했을 때 중복 연결을 제거하기 위한 인덱스
+# 동일 viewer가 재접속했을 때 중복 연결 제거
 viewer_sessions = {}
 
 
 async def send_json(ws, data):
     try:
         await ws.send(json.dumps(data, ensure_ascii=False))
-        last_seen[ws] = time.monotonic()
         return True
     except Exception:
         return False
@@ -42,11 +37,9 @@ async def close_safely(ws, code=1000, reason=""):
 
 
 async def remove_client(ws):
-    """연결 하나를 모든 인덱스에서 완전히 제거한다."""
     info = client_info.pop(ws, {})
-    last_seen.pop(ws, None)
-
     group = info.get("group")
+
     if group:
         clients[group].discard(ws)
 
@@ -77,7 +70,6 @@ async def broadcast(group, data, exclude=None):
 
 
 def get_viewer_count(group):
-    """같은 client_id 중복 접속은 한 명으로 계산한다."""
     unique_ids = set()
     anonymous_count = 0
 
@@ -173,7 +165,6 @@ async def claim_host(group, ws):
 
 
 async def register_viewer_session(ws, group, client_id):
-    """같은 viewer 프로그램이 재접속하면 예전 연결을 닫아 중복 집계를 막는다."""
     client_id = str(client_id or "").strip()
 
     if not client_id:
@@ -183,7 +174,11 @@ async def register_viewer_session(ws, group, client_id):
     old_ws = viewer_sessions.get(key)
 
     if old_ws and old_ws is not ws and not getattr(old_ws, "closed", False):
-        logging.info("Replacing duplicate viewer session group=%s client_id=%s", group, client_id)
+        logging.info(
+            "Replacing duplicate viewer session group=%s client_id=%s",
+            group,
+            client_id
+        )
         await close_safely(old_ws, code=4001, reason="duplicate viewer session")
         await remove_client(old_ws)
 
@@ -195,8 +190,6 @@ async def handler(ws):
 
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=10)
-        last_seen[ws] = time.monotonic()
-
         hello = json.loads(raw)
 
         if hello.get("type") != "hello":
@@ -241,7 +234,6 @@ async def handler(ws):
         await announce_viewer_count(group)
 
         async for raw in ws:
-            last_seen[ws] = time.monotonic()
             data = json.loads(raw)
             kind = data.get("type")
 
@@ -293,60 +285,21 @@ async def handler(ws):
                 clients.pop(group, None)
 
 
-async def stale_connection_cleanup():
-    """
-    브라우저 강제종료·인터넷 단절 등으로 종료 이벤트가 늦게 오는 연결을 정리한다.
-    35초 동안 아무 통신이 없으면 닫고 인원수를 갱신한다.
-    """
-    while True:
-        await asyncio.sleep(5)
-        now = time.monotonic()
-        stale = []
-
-        for ws, seen_at in list(last_seen.items()):
-            if getattr(ws, "closed", False) or now - seen_at > 35:
-                stale.append(ws)
-
-        affected_groups = set()
-
-        for ws in stale:
-            info = client_info.get(ws, {})
-            group = info.get("group")
-
-            if group:
-                affected_groups.add(group)
-
-            await close_safely(ws, code=4000, reason="stale connection")
-            await remove_client(ws)
-
-            if group and hosts.get(group) is ws:
-                hosts.pop(group, None)
-
-        for group in affected_groups:
-            await announce_host(group)
-            await announce_viewer_count(group)
-
-
 async def main():
-    cleanup_task = asyncio.create_task(stale_connection_cleanup())
-
-    try:
-        async with websockets.serve(
-            handler,
+    async with websockets.serve(
+        handler,
+        HOST,
+        PORT,
+        ping_interval=10,
+        ping_timeout=20,
+        close_timeout=2
+    ):
+        logging.info(
+            "시아의개고생 중계서버 실행: ws://%s:%s",
             HOST,
-            PORT,
-            ping_interval=10,
-            ping_timeout=10,
-            close_timeout=2
-        ):
-            logging.info(
-                "시아의개고생 중계서버 실행: ws://%s:%s",
-                HOST,
-                PORT
-            )
-            await asyncio.Future()
-    finally:
-        cleanup_task.cancel()
+            PORT
+        )
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
